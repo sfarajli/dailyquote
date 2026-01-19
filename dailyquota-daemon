@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import os, sys, time, subprocess
+
+from lib.paths import config_path, state_path, runtime_dir, lock_path, pid_path
+from lib.config import Config
+from lib.state import State, rollover_if_needed, now_epoch, clamp_delta
+from lib.lock import LockFile, LockError
+from lib.timefmt import hms
+from lib.enforce_poweroff import run_poweroff
+
+def notify(msg: str) -> None:
+    # best-effort notification (works if notify-send + notification daemon exist)
+    try:
+        subprocess.Popen(["notify-send", "dailyquota", msg])
+    except Exception:
+        pass
+
+def write_pid() -> None:
+    d = runtime_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    pid_path().write_text(str(os.getpid()) + "\n", encoding="utf-8")
+
+def main() -> int:
+    cfg = Config.load(config_path())
+
+    # single instance
+    lock = LockFile(lock_path())
+    try:
+        lock.acquire()
+    except LockError as e:
+        sys.stderr.write(str(e) + "\n")
+        return 1
+
+    write_pid()
+
+    st = State.load(state_path())
+    rollover_if_needed(st)
+    st.last_ts = now_epoch()
+    st.save(state_path())
+
+    warned = set()  # seconds thresholds already notified (for today)
+
+    while True:
+        cfg = Config.load(config_path())  # allow live edits
+        st = State.load(state_path())
+        rollover_if_needed(st)
+
+        now = now_epoch()
+        delta = clamp_delta(now - st.last_ts, cfg.poll_seconds * 4)
+        st.used_seconds += delta
+        st.last_ts = now
+
+        remaining = max(0, cfg.limit_seconds - st.used_seconds)
+
+        # warnings
+        for w in (cfg.warn_seconds or []):
+            if remaining <= w and w not in warned and remaining > 0:
+                warned.add(w)
+                notify(f"{hms(remaining)} remaining")
+                break
+
+        st.save(state_path())
+
+        if (not st.triggered) and st.used_seconds >= cfg.limit_seconds:
+            st.triggered = True
+            st.save(state_path())
+
+            if cfg.grace_seconds > 0:
+                notify(f"Limit reached. Powering off in {cfg.grace_seconds}s")
+                time.sleep(cfg.grace_seconds)
+
+            # final attempt
+            run_poweroff(cfg.action_cmd)
+            # if poweroff fails (permissions), keep trying every poll
+            time.sleep(cfg.poll_seconds)
+            continue
+
+        time.sleep(cfg.poll_seconds)
+
+if __name__ == "__main__":
+    raise SystemExit(main())

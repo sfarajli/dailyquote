@@ -1,111 +1,120 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import sys, time
+import os, time, json
 from pathlib import Path
+from typing import Dict
 
-from lib.paths import config_path, state_path
-from lib.config import Config
-from lib.state import State, rollover_if_needed, now_epoch, clamp_delta
-from lib.timefmt import hms
+APP = "dailyquota"
 
-USAGE = """dailyquota - CLI
+def today() -> str:
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+def now() -> int:
+    return int(time.time())
+
+def config_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else (Path.home() / ".config")
+    return base / APP / "config.conf"
+
+def state_path() -> Path:
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg) if xdg else (Path.home() / ".local" / "share")
+    return base / APP / "state.json"
+
+def parse_kv(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        return {}
+    out: Dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+def geti(d: Dict[str, str], k: str, default: int) -> int:
+    try:
+        return int(d.get(k, str(default)))
+    except Exception:
+        return default
+
+def gets(d: Dict[str, str], k: str, default: str) -> str:
+    v = d.get(k)
+    return v if v is not None and v != "" else default
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+def load_state() -> dict:
+    p = state_path()
+    if not p.exists():
+        return {"date": today(), "used": 0, "last": now(), "locked_date": ""}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {"date": today(), "used": 0, "last": now(), "locked_date": ""}
+
+def save_state(st: dict) -> None:
+    atomic_write(state_path(), json.dumps(st, indent=2) + "\n")
+
+def rollover(st: dict) -> dict:
+    if st.get("date") != today():
+        return {"date": today(), "used": 0, "last": now(), "locked_date": ""}
+    return st
+
+def hms(sec: int) -> str:
+    sec = max(0, int(sec))
+    return f"{sec//3600:02d}:{(sec%3600)//60:02d}:{sec%60:02d}"
+
+import sys
+
+USAGE = """dailyquota
 
 Commands:
-  dailyquota status           Show used/remaining today
-  dailyquota remaining        Print remaining time (HH:MM:SS) and exit 0
-  dailyquota remaining --s    Print remaining seconds (integer)
-  dailyquota set 2h|120m|7200 Set daily limit (writes config)
-  dailyquota reset            Reset today's counter to 0 (edits state)
+  dailyquota remaining        Print remaining (HH:MM:SS)
+  dailyquota remaining --s    Print remaining seconds
+  dailyquota status           Print used/remaining/limit
 """
-
-def parse_duration(s: str) -> int:
-    s = s.strip().lower()
-    if s.isdigit():
-        return int(s)
-    # formats: 2h, 120m, 30s
-    mul = 1
-    if s.endswith("h"):
-        mul = 3600
-        s = s[:-1]
-    elif s.endswith("m"):
-        mul = 60
-        s = s[:-1]
-    elif s.endswith("s"):
-        mul = 1
-        s = s[:-1]
-    if not s.isdigit():
-        raise ValueError("bad duration")
-    return int(s) * mul
-
-def write_limit(limit: int) -> None:
-    p = config_path()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    # preserve existing settings if present
-    existing = p.read_text(encoding="utf-8") if p.exists() else ""
-    lines = []
-    found = False
-    for line in existing.splitlines():
-        if line.strip().startswith("limit_seconds="):
-            lines.append(f"limit_seconds={limit}")
-            found = True
-        else:
-            lines.append(line)
-    if not found:
-        if lines and lines[-1].strip() != "":
-            lines.append("")
-        lines.append(f"limit_seconds={limit}")
-    p.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-
-def effective_used(cfg: Config, st: State) -> int:
-    rollover_if_needed(st)
-    now = now_epoch()
-    delta = clamp_delta(now - st.last_ts, cfg.poll_seconds * 4)
-    return int(st.used_seconds + delta)
 
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         sys.stderr.write(USAGE)
         return 2
 
+    cfg = parse_kv(config_path())
+    limit = geti(cfg, "limit_seconds", 7200)
+    poll = max(1, geti(cfg, "poll_seconds", 5))
+
+    st = rollover(load_state())
+
+    # compute effective used "as of now"
+    t = now()
+    last = int(st.get("last", t))
+    delta = t - last
+    if delta < 0:
+        delta = 0
+    if delta > poll * 4:
+        delta = poll * 4
+    used = int(st.get("used", 0)) + delta
+
+    remaining = max(0, limit - used)
+
     cmd = argv[1]
-    cfg = Config.load(config_path())
-    st = State.load(state_path())
+    if cmd == "remaining":
+        if len(argv) >= 3 and argv[2] == "--s":
+            print(int(remaining))
+        else:
+            print(hms(remaining))
+        return 0
 
     if cmd == "status":
-        used = effective_used(cfg, st)
-        rem = max(0, cfg.limit_seconds - used)
-        sys.stdout.write(f"remaining {hms(rem)} (used {hms(used)} / {hms(cfg.limit_seconds)})\n")
-        return 0
-
-    if cmd == "remaining":
-        used = effective_used(cfg, st)
-        rem = max(0, cfg.limit_seconds - used)
-        if len(argv) >= 3 and argv[2] == "--s":
-            sys.stdout.write(str(rem) + "\n")
-        else:
-            sys.stdout.write(hms(rem) + "\n")
-        return 0
-
-    if cmd == "set":
-        if len(argv) < 3:
-            sys.stderr.write("dailyquota set requires a value like 2h, 120m, or 7200\n")
-            return 2
-        try:
-            limit = parse_duration(argv[2])
-        except Exception:
-            sys.stderr.write("invalid duration; use 2h, 120m, 7200, etc.\n")
-            return 2
-        if limit <= 0:
-            sys.stderr.write("limit must be > 0\n")
-            return 2
-        write_limit(limit)
-        sys.stdout.write(f"set limit_seconds={limit}\n")
-        return 0
-
-    if cmd == "reset":
-        st = State.fresh()
-        st.save(state_path())
-        sys.stdout.write("reset: used_seconds=0\n")
+        print(f"remaining {hms(remaining)} (used {hms(used)} / {hms(limit)})")
+        print("locked: yes (today)" if st.get("locked_date") == today() else "locked: no")
         return 0
 
     sys.stderr.write(USAGE)

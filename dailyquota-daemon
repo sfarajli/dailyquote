@@ -1,82 +1,128 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import os, sys, time, subprocess
+import os, time, json
+from pathlib import Path
+from typing import Dict
 
-from lib.paths import config_path, state_path, runtime_dir, lock_path, pid_path
-from lib.config import Config
-from lib.state import State, rollover_if_needed, now_epoch, clamp_delta
-from lib.lock import LockFile, LockError
-from lib.timefmt import hms
-from lib.enforce_poweroff import run_poweroff
+APP = "dailyquota"
 
-def notify(msg: str) -> None:
-    # best-effort notification (works if notify-send + notification daemon exist)
+def today() -> str:
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+def now() -> int:
+    return int(time.time())
+
+def config_path() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else (Path.home() / ".config")
+    return base / APP / "config.conf"
+
+def state_path() -> Path:
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg) if xdg else (Path.home() / ".local" / "share")
+    return base / APP / "state.json"
+
+def parse_kv(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        return {}
+    out: Dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+def geti(d: Dict[str, str], k: str, default: int) -> int:
     try:
-        subprocess.Popen(["notify-send", "dailyquota", msg])
+        return int(d.get(k, str(default)))
     except Exception:
-        pass
+        return default
 
-def write_pid() -> None:
-    d = runtime_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    pid_path().write_text(str(os.getpid()) + "\n", encoding="utf-8")
+def gets(d: Dict[str, str], k: str, default: str) -> str:
+    v = d.get(k)
+    return v if v is not None and v != "" else default
+
+def atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+def load_state() -> dict:
+    p = state_path()
+    if not p.exists():
+        return {"date": today(), "used": 0, "last": now(), "locked_date": ""}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {"date": today(), "used": 0, "last": now(), "locked_date": ""}
+
+def save_state(st: dict) -> None:
+    atomic_write(state_path(), json.dumps(st, indent=2) + "\n")
+
+def rollover(st: dict) -> dict:
+    if st.get("date") != today():
+        return {"date": today(), "used": 0, "last": now(), "locked_date": ""}
+    return st
+
+def hms(sec: int) -> str:
+    sec = max(0, int(sec))
+    return f"{sec//3600:02d}:{(sec%3600)//60:02d}:{sec%60:02d}"
+
+import subprocess
+
+def poweroff(grace_seconds: int, action_cmd: str) -> None:
+    print(f"Turning off in {grace_seconds} seconds", flush=True)
+    time.sleep(max(0, grace_seconds))
+    subprocess.run(action_cmd, shell=True)
 
 def main() -> int:
-    cfg = Config.load(config_path())
-
-    # single instance
-    lock = LockFile(lock_path())
-    try:
-        lock.acquire()
-    except LockError as e:
-        sys.stderr.write(str(e) + "\n")
-        return 1
-
-    write_pid()
-
-    st = State.load(state_path())
-    rollover_if_needed(st)
-    st.last_ts = now_epoch()
-    st.save(state_path())
-
-    warned = set()  # seconds thresholds already notified (for today)
+    cfg = parse_kv(config_path())
+    limit = geti(cfg, "limit_seconds", 7200)
+    poll = max(1, geti(cfg, "poll_seconds", 5))
+    grace = max(0, geti(cfg, "grace_seconds", 30))
+    action = gets(cfg, "action_cmd", "sudo /sbin/poweroff")
 
     while True:
-        cfg = Config.load(config_path())  # allow live edits
-        st = State.load(state_path())
-        rollover_if_needed(st)
+        # reload config so edits take effect without restart
+        cfg = parse_kv(config_path())
+        limit = geti(cfg, "limit_seconds", limit)
+        poll = max(1, geti(cfg, "poll_seconds", poll))
+        grace = max(0, geti(cfg, "grace_seconds", grace))
+        action = gets(cfg, "action_cmd", action)
 
-        now = now_epoch()
-        delta = clamp_delta(now - st.last_ts, cfg.poll_seconds * 4)
-        st.used_seconds += delta
-        st.last_ts = now
+        st = rollover(load_state())
 
-        remaining = max(0, cfg.limit_seconds - st.used_seconds)
-
-        # warnings
-        for w in (cfg.warn_seconds or []):
-            if remaining <= w and w not in warned and remaining > 0:
-                warned.add(w)
-                notify(f"{hms(remaining)} remaining")
-                break
-
-        st.save(state_path())
-
-        if (not st.triggered) and st.used_seconds >= cfg.limit_seconds:
-            st.triggered = True
-            st.save(state_path())
-
-            if cfg.grace_seconds > 0:
-                notify(f"Limit reached. Powering off in {cfg.grace_seconds}s")
-                time.sleep(cfg.grace_seconds)
-
-            # final attempt
-            run_poweroff(cfg.action_cmd)
-            # if poweroff fails (permissions), keep trying every poll
-            time.sleep(cfg.poll_seconds)
+        # If locked for today, power off again after reboot (once X starts)
+        if st.get("locked_date") == today():
+            save_state(st)
+            poweroff(grace, action)
+            time.sleep(poll)
             continue
 
-        time.sleep(cfg.poll_seconds)
+        t = now()
+        last = int(st.get("last", t))
+        # clamp delta to avoid huge jumps after suspend / clock changes
+        delta = t - last
+        if delta < 0:
+            delta = 0
+        if delta > poll * 4:
+            delta = poll * 4
+
+        st["used"] = int(st.get("used", 0)) + delta
+        st["last"] = t
+        save_state(st)
+
+        if st["used"] >= limit:
+            st["locked_date"] = today()
+            save_state(st)
+            poweroff(grace, action)
+            time.sleep(poll)
+            continue
+
+        time.sleep(poll)
 
 if __name__ == "__main__":
     raise SystemExit(main())
